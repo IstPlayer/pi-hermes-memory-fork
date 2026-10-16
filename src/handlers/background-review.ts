@@ -4,7 +4,7 @@
  * See PLAN.md → "Hermes Source File Reference Map" for source lines.
  *
  * Default transport: in-process complete() side-channel (preserves parent LLM cache).
- * Fallback: pi.exec("pi", ["-p", ...]) subprocess when direct path is unavailable.
+ * Fallback when the direct transport is unavailable or fails: a `pi -p` child built by `execChildPrompt` in `pi-child-process.ts`, behind the process-tree watchdog.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -16,12 +16,14 @@ import {
 import { MemoryStore } from "../store/memory-store.js";
 import { DatabaseManager } from "../store/db.js";
 import type { MemoryConfig } from "../types.js";
+import type { EnsureMemoryReady } from "../memory-initialization.js";
 import { applyRecentMessageLimit, collectMessageParts } from "./message-parts.js";
-import { execChildPrompt, resolveChildPiModel } from "./pi-child-process.js";
-import { runDirectMemoryCompletion, usesDirectTransport, type DirectReviewResult } from "./review-memory-ops.js";
+import { cleanChildStderr, execChildPrompt, resolveChildPiModel } from "./pi-child-process.js";
+import { REVIEW_COMPLETION_TIMEOUT_MS, runDirectMemoryCompletion, usesDirectTransport, type DirectReviewResult } from "./review-memory-ops.js";
 
 import { resolveProjectName, resolveProjectStore, type ProjectNameRef, type ProjectStoreRef } from "../project-context.js";
 export interface BackgroundReviewOptions {
+  ensureMemoryReady?: EnsureMemoryReady;
   dbManager?: DatabaseManager | null;
   projectName?: ProjectNameRef;
   deps?: BackgroundReviewDeps;
@@ -149,7 +151,7 @@ async function runSubprocessReview(
     // Session-scoped signal only. The turn signal belongs to the interactive
     // agent run; forwarding it cancels unrelated review on a later user abort.
     signal,
-    timeoutMs: 120000,
+    timeoutMs: REVIEW_COMPLETION_TIMEOUT_MS,
   });
 }
 
@@ -253,6 +255,7 @@ export function setupBackgroundReview(
         return;
       }
       if (allParts.length < 4) return;
+      await options.ensureMemoryReady?.(ctx);
       if (sessionCancelled()) return;
 
       const parts = applyRecentMessageLimit(allParts, config.reviewRecentMessages);
@@ -272,7 +275,7 @@ export function setupBackgroundReview(
       if (usesDirectTransport(config)) {
         try {
           const directResult = await runDirectReview(
-            ctx as Pick<ExtensionContext, "model" | "modelRegistry">,
+            ctx,
             store,
             activeProjectStore,
             {
@@ -283,7 +286,7 @@ export function setupBackgroundReview(
                 buildMemoryTargetRoutingGuidance(activeProjectStore !== null),
               ].join("\n"),
               config,
-              timeoutMs: 120000,
+              timeoutMs: REVIEW_COMPLETION_TIMEOUT_MS,
               signal: sessionAbort.signal,
             },
             dbManager,
@@ -334,7 +337,7 @@ export function setupBackgroundReview(
       if (subprocessResult.code === 0) {
         notifyIfSaved(shouldNotifySubprocess(subprocessResult.stdout));
       } else if (directFailure) {
-        const subprocessDetail = subprocessResult.stderr?.trim() || subprocessResult.stdout?.trim()
+        const subprocessDetail = cleanChildStderr(subprocessResult.stderr) || subprocessResult.stdout?.trim()
           || `exit code ${subprocessResult.code}`;
         notifyTransportFailure(directFailure, subprocessDetail);
       }
